@@ -13,14 +13,11 @@ def sample_and_plot(ikey, okey, mat, l, s0, s1):
     """
     s0 = t.randperm(l)[:s0].sort().values
     s1 = t.linspace(0, l-1, s1).to(t.int)
-    lines = mat(ikey[s1], okey[s0])
+    lines = mat(ikey[s0], okey[s1]).T
     for i, oview in enumerate(lines.T):
         color_grad = (i/lines.T.shape[0])
         plt.plot(s1, oview, color=(color_grad, 0, 1-color_grad), label=f"line: {s0[i]}")
         plt.plot(s1, (s1 <= s0[i]) * 1.0, color=(color_grad, 0, 1-color_grad), label=f"line: {s0[i]}")
-        mono = t.argwhere((oview[0:-2] <= oview[1:-1]) == (oview[1:-1] >= oview[2:]))
-        # plt.scatter(s1[mono], oview[mono], color=(color_grad, 0, 1-color_grad))
-        # print((s1[mono[1:]] - s1[mono[:-1]]).flatten().sort().values)
     plt.plot(s1, t.ones_like(s1) * 0.05, color='green')
     plt.legend()
 
@@ -84,14 +81,15 @@ def dirichlet_pow_kernel(LEN, KAP):
     i = i.unsqueeze(-1) / LEN * t.pi
     f = t.arange(0, 2*N)
     v = t.concat([(-i * f).cos(), (-i * f).sin()], dim=-1).cumsum(dim=0) / LEN
-    v = v - 0.05
-    ALPHA = 0.0
+    v = v - t.concat([t.zeros_like(v)[:LEN//4], v[:-LEN//4]], dim=-2)
+    ALPHA = 0.75
     i = t.arange(0, LEN)
     i = i.unsqueeze(-1) / LEN * t.pi
     f = t.arange(0, 2*N)
     c = (2*N - f.abs()) * ALPHA / (2*N) + (1-ALPHA)
     c[0] *= 1/2
     u = t.concat([(-i * f).cos() * c, (-i * f).sin() * c], dim=-1)
+    u = u * (1 + t.randn_like(u) * 0.025)
     return v, u, lambda ikey, okey: t.einsum("ij, kj -> ik", ikey, okey)
 
 @t.no_grad()
@@ -156,8 +154,8 @@ def random_direction_kernel(LEN, KAP):
 if __name__ == '__main__':
     t.manual_seed(154)
     with t.no_grad():
-        LEN = 200
-        KAP = 256
+        LEN = 2_000_000
+        KAP = 64
         ikey, okey, mat = dirichlet_pow_kernel(LEN, KAP)
         sample_and_plot(ikey, okey, mat, LEN, 10, 10000)
         # sample_and_draw_matrix(ikey, okey, mat, LEN, 100)
