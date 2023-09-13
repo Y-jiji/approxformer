@@ -81,15 +81,14 @@ def dirichlet_pow_kernel(LEN, KAP):
     i = i.unsqueeze(-1) / LEN * t.pi
     f = t.arange(0, 2*N)
     v = t.concat([(-i * f).cos(), (-i * f).sin()], dim=-1).cumsum(dim=0) / LEN
-    v = v - t.concat([t.zeros_like(v)[:LEN//4], v[:-LEN//4]], dim=-2)
-    ALPHA = 0.75
+    ALPHA = 0.5
     i = t.arange(0, LEN)
     i = i.unsqueeze(-1) / LEN * t.pi
     f = t.arange(0, 2*N)
     c = (2*N - f.abs()) * ALPHA / (2*N) + (1-ALPHA)
     c[0] *= 1/2
     u = t.concat([(-i * f).cos() * c, (-i * f).sin() * c], dim=-1)
-    u = u * (1 + t.randn_like(u) * 0.025)
+    u = u * (1 + t.randn_like(u) * 0.1)
     return v, u, lambda ikey, okey: t.einsum("ij, kj -> ik", ikey, okey)
 
 @t.no_grad()
@@ -155,7 +154,7 @@ if __name__ == '__main__':
     t.manual_seed(154)
     with t.no_grad():
         LEN = 2_000_000
-        KAP = 64
+        KAP = 128
         ikey, okey, mat = dirichlet_pow_kernel(LEN, KAP)
         sample_and_plot(ikey, okey, mat, LEN, 10, 10000)
         # sample_and_draw_matrix(ikey, okey, mat, LEN, 100)
