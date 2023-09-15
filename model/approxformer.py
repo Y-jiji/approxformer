@@ -33,6 +33,7 @@ class ApproxFormer(t.nn.Module):
             RotaryPE(128),
             DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=4, W=128, G=4, F=1024),
             DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=4, W=128, G=4, F=1024),
+            DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=4, W=128, G=4, F=1024),
         )
         self.output = t.nn.Linear(128, N, bias=False)
         with t.no_grad():
@@ -108,7 +109,6 @@ class DecoderLayer(t.nn.Module):
         p: dropout rate
         """
         super().__init__()
-        assert C % 4 == 0
         self.cnn = CNNLayer(D * H, W)
         self.pe = RotaryPE(D)
         self.ln0 = t.nn.LayerNorm((A * H))
@@ -136,6 +136,19 @@ class DecoderLayer(t.nn.Module):
         self.M = M
         self.L = L
         self.W = W
+        # precomputed coefficients for kernel function
+        def combi(n, x):
+            return t.arange(n+1-x, n+1).prod() / t.arange(1, x+1).prod()
+        def coeff(u, pow, n):
+            u = u + pow * n + pow - 1
+            r = t.zeros_like(u).float()
+            for i in range(pow):
+                v = (u.unsqueeze(-1) - (2 * n + 1) * i - t.arange(pow-1)).relu()
+                c = combi(pow, i)
+                r += c * (2 * ((i + 1) % 2) - 1) * v.prod(-1) / (t.arange(pow-1) + 1).prod(-1)
+            return r
+        assert self.C % 4 == 0
+        self._coeffs = coeff(t.arange(0, self.C+1), 4, self.C//4)
 
     @property
     def device(self):
@@ -145,34 +158,52 @@ class DecoderLayer(t.nn.Module):
     def normalize(x):
         return x / (x**2).sum(dim=-1, keepdim=True)**(1/2)
 
+    @staticmethod
+    def d_pow(x, l, n, pow, off):
+        def combi(n, x):
+            return t.arange(n+1-x, n+1).prod() / t.arange(1, x+1).prod()
+        def coeff(u):
+            u = u + pow * n + pow - 1
+            r = t.zeros_like(u).float()
+            for i in range(pow):
+                v = (u.unsqueeze(-1) - (2 * n + 1) * i - t.arange(pow-1)).relu()
+                c = combi(pow, i)
+                r += c * (2 * ((i + 1) % 2) - 1) * v.prod(-1) / (t.arange(pow-1) + 1).prod(-1)
+            return r
+        a = t.arange(0, pow*n+1)
+        u = coeff(a) * t.cos(a * (((x + off) / l) * t.pi).unsqueeze(-1)) / n ** (pow-1) / 2
+        u[:, 0] /= 2
+        v = t.cos(-a * ((x / l) * t.pi).unsqueeze(-1)).cumsum(0) / l
+        return u, v
+
     @t.no_grad()
     def inp_position_code(self, OFF:int, LEN:int):
         """
         compute output position code (IPC) from positions
         """
-        N = self.C // 4
-        ALPHA = 0.0
-        i = t.arange(0, LEN, device=self.device) + OFF
-        i = i.unsqueeze(-1) / self.L * t.pi
-        f = t.arange(0, 2*N, device=self.device)
-        c = (2*N - f.abs()) * ALPHA / (2*N) + (1-ALPHA)
-        c[0] *= 1/2
-        u = t.concat([(-i * f).cos() * c, (-i * f).sin() * c], dim=-1)
-        return u.reshape(LEN, self.C)
+        pow = 4
+        n = self.C // pow
+        a = t.arange(0, self.C+1)
+        l = self.L
+        x = t.arange(0, LEN)
+        off = self.L / n + OFF
+        x = t.cos(a * (((x + off) / l) * t.pi).unsqueeze(-1))
+        x[:, 0] /= 2
+        return self._coeffs * x / n ** (pow-1) / 2
 
     @t.no_grad()
     def out_position_code(self, OFF:int, LEN:int):
         """
         compute output position code (OPC) from positions
         """
-        N = self.C // 4
-        OFF += -2 * self.L / N
-        i = t.arange(0, LEN, device=self.device) + OFF
-        i = i.unsqueeze(-1) / self.L * t.pi
-        f = t.arange(0, 2*N, device=self.device)
-        v = t.concat([(-i * f).cos(), (-i * f).sin()], dim=-1).cumsum(dim=0) / self.L
-        v = v * (1 + t.randn_like(v) * 0.025).relu()
-        return v.reshape(LEN, self.C)
+        a = t.arange(0, self.C+1)
+        l = self.L
+        off = OFF
+        x = t.arange(0, LEN)
+        x = t.cos(-a * (((x + off) / l) * t.pi).unsqueeze(-1)).cumsum(0) / l
+        if self.training:
+            x[:, 0] += 1e-3 * t.randn_like(x[:, 0])
+        return x
 
     def dot(self, x, y):
         """
@@ -215,7 +246,7 @@ class DecoderLayer(t.nn.Module):
         return x + self.ffn(self.ln3(self.ln2(v1) + v2 + x.unsqueeze(dim=-1)).flatten(-2, -1)), cache
 
     def init_cache(self) -> tuple[int, t.Tensor, t.Tensor]:
-        return 0, t.zeros(self.M, self.C, self.D, self.H, device=self.device), None
+        return 0, t.zeros(self.M, self.C+1, self.D, self.H, device=self.device), None
 
 if __name__ == '__main__':
     with t.no_grad():

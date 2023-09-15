@@ -91,6 +91,23 @@ def dirichlet_pow_kernel(LEN, KAP):
     u = u * (1 + t.randn_like(u) * 0.1)
     return v, u, lambda ikey, okey: t.einsum("ij, kj -> ik", ikey, okey)
 
+def d_pow(x, l, n, pow, off):
+    def combi(n, x):
+        return t.arange(n+1-x, n+1).prod() / t.arange(1, x+1).prod()
+    def coeff(u):
+        u = u + pow * n + pow - 1
+        r = t.zeros_like(u).float()
+        for i in range(pow):
+            v = (u.unsqueeze(-1) - (2 * n + 1) * i - t.arange(pow-1)).relu()
+            c = combi(pow, i)
+            r += c * (2 * ((i + 1) % 2) - 1) * v.prod(-1) / (t.arange(pow-1) + 1).prod(-1)
+        return r
+    a = t.arange(0, pow*n+1)
+    u = coeff(a) * t.cos(a * (((x + off) / l) * t.pi).unsqueeze(-1)) / n ** (pow-1) / 2
+    u[:, 0] /= 2
+    v = t.cos(-a * ((x / l) * t.pi).unsqueeze(-1)).cumsum(0) / l
+    return v, u
+
 @t.no_grad()
 def random_spinning_kernel(LEN, KAP):
     OF1 = 0
