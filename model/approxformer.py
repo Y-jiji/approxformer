@@ -32,8 +32,7 @@ class ApproxFormer(t.nn.Module):
         self.inner = IterSequential(
             RotaryPE(128),
             DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=4, W=128, G=4, F=1024),
-            DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=4, W=128, G=4, F=1024),
-            DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=4, W=128, G=4, F=1024),
+            DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=2, W=128, G=4, F=1024),
         )
         self.output = t.nn.Linear(128, N, bias=False)
         with t.no_grad():
@@ -115,6 +114,7 @@ class DecoderLayer(t.nn.Module):
         self.ln1 = t.nn.LayerNorm((A * H))
         self.ln2 = t.nn.LayerNorm((D, H))
         self.ln3 = t.nn.LayerNorm((D, H))
+        # scaling down will alleviate some numerical issues
         self.q_mem = t.nn.Parameter(t.randn(M, A * H) / 1000)
         self.k_mem = t.nn.Parameter(t.randn(M, A * H) / 1000)
         self.k_inp = t.nn.Linear(D, A * H)
@@ -183,23 +183,23 @@ class DecoderLayer(t.nn.Module):
         """
         pow = 4
         n = self.C // pow
-        a = t.arange(0, self.C+1)
+        a = t.arange(0, self.C+1, device=self.device)
         l = self.L
-        x = t.arange(0, LEN)
+        x = t.arange(0, LEN, device=self.device)
         off = self.L / n + OFF
         x = t.cos(a * (((x + off) / l) * t.pi).unsqueeze(-1))
         x[:, 0] /= 2
-        return self._coeffs * x / n ** (pow-1) / 2
+        return self._coeffs.to(self.device) * x / n ** (pow-1) / 2
 
     @t.no_grad()
     def out_position_code(self, OFF:int, LEN:int):
         """
         compute output position code (OPC) from positions
         """
-        a = t.arange(0, self.C+1)
+        a = t.arange(0, self.C+1, device=self.device)
         l = self.L
         off = OFF
-        x = t.arange(0, LEN)
+        x = t.arange(0, LEN, device=self.device)
         x = t.cos(-a * (((x + off) / l) * t.pi).unsqueeze(-1)).cumsum(0) / l
         if self.training:
             x[:, 0] += 1e-3 * t.randn_like(x[:, 0])
@@ -210,6 +210,7 @@ class DecoderLayer(t.nn.Module):
         compute multi-head attention
         """
         a = t.einsum("...ijh, ...kjh -> ...ikh", x.unflatten(-1, (self.A, self.H)), y.unflatten(-1, (self.A, self.H)))
+        assert (a < 15).all().item()
         return a.clamp_max(15).exp()
 
     def forward(self, x: t.Tensor) -> t.Tensor:

@@ -14,7 +14,7 @@ def run_tiny_shakespeare():
     running_loss = 5.0
     data = t.frombuffer(text.encode("ascii"), dtype=t.uint8, requires_grad=False).to(t.int).to('cuda:0')
     try:
-        model_state_dict, optim_state_dict = t.load(f'ckpt/2023-09-15')
+        model_state_dict, optim_state_dict = t.load(f'ckpt/{datetime.datetime.date()}')
         model.load_state_dict(model_state_dict)
         optim.load_state_dict(optim_state_dict)
     except:
@@ -42,11 +42,14 @@ def run_tiny_shakespeare():
                 cache = model.init_cache()
                 x = data[L*I:L*I+L+1]
                 loss = 0.0
+                acc = 0.0
                 for i in range(L):
                     if i % 100 == 0: print(f'iterate {i:005} / {L}')
                     y, cache = model.iterate(x[i:i+1], cache)
                     loss += -(y[t.arange(y.shape[-2], device=y.device), x[i+1:i+2]] + 1e-30).log()
+                    acc += (y.argmax(-1) == x[i+1:i+2])
                 print(loss / L)
+                print(acc / L)
 
 def run_wikitext():
     pass
