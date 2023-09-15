@@ -115,8 +115,8 @@ class DecoderLayer(t.nn.Module):
         self.ln1 = t.nn.LayerNorm((A * H))
         self.ln2 = t.nn.LayerNorm((D, H))
         self.ln3 = t.nn.LayerNorm((D, H))
-        self.q_mem = t.nn.Parameter(t.randn(M, A * H) / 10)
-        self.k_mem = t.nn.Parameter(t.randn(M, A * H) / 10)
+        self.q_mem = t.nn.Parameter(t.randn(M, A * H) / 1000)
+        self.k_mem = t.nn.Parameter(t.randn(M, A * H) / 1000)
         self.k_inp = t.nn.Linear(D, A * H)
         self.q_out = t.nn.Linear(D, A * H)
         self.v_inp = t.nn.Linear(D, D * H)
@@ -171,7 +171,7 @@ class DecoderLayer(t.nn.Module):
         i = i.unsqueeze(-1) / self.L * t.pi
         f = t.arange(0, 2*N, device=self.device)
         v = t.concat([(-i * f).cos(), (-i * f).sin()], dim=-1).cumsum(dim=0) / self.L
-        v = v * (1 + t.randn_like(v) * 0.1)
+        v = v * (1 + t.randn_like(v) * 0.025).relu()
         return v.reshape(LEN, self.C)
 
     def dot(self, x, y):
