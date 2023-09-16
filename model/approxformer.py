@@ -30,7 +30,7 @@ class ApproxFormer(t.nn.Module):
         super().__init__()
         self.embed = t.nn.Embedding(N, 128)
         self.inner = IterSequential(
-            RotaryPE(128),
+            RoPE(128),
             DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=4, W=128, G=4, F=1024),
             DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=2, W=128, G=4, F=1024),
         )
@@ -48,7 +48,7 @@ class ApproxFormer(t.nn.Module):
         x, cache = self.inner.iterate(self.embed(x), cache)
         return self.output(x).softmax(dim=-1), cache
 
-class RotaryPE(t.nn.Module):
+class RoPE(t.nn.Module):
     def __init__(self, N: int) -> None:
         super().__init__()
         self.N = N
@@ -93,6 +93,153 @@ class CNNLayer(t.nn.Module):
                   t.concat([window, x], dim=-2))
         return self.forward(window)[..., -1:, :, :], window
 
+class GapAttention(t.nn.Module):
+    POW = 4
+    def __init__(self, D, H, C, M, L) -> None:
+        super().__init__()
+        # dummy variable as device indicator
+        self.dummy = t.nn.Parameter(t.tensor(0.0))
+        # miscellaneous layers
+        self.pe = RoPE(D)
+        self.ln = t.nn.LayerNorm(D * H)
+        # key, query and value
+        self.k = t.nn.Sequential(
+            t.nn.Linear((D, M * H)), t.nn.Unflatten(-1, (M, H)))
+        self.q = t.nn.Sequential(
+            t.nn.Linear((D, M * H)), t.nn.Unflatten(-1, (M, H)))
+        self.v = t.nn.Sequential(
+            t.nn.Linear((D, D * H)), t.nn.Unflatten(-1, (D, H)))
+        # precomputed coefficients for kernel function
+        def combi(n, x):
+            return t.arange(n+1-x, n+1).prod() / t.arange(1, x+1).prod()
+        def coeff(u, pow, n):
+            u = u + pow * n + pow - 1
+            r = t.zeros_like(u).float()
+            for i in range(pow):
+                v = (u.unsqueeze(-1) - (2 * n + 1) * i - t.arange(pow-1)).relu()
+                c = combi(pow, i)
+                r += c * (2 * ((i + 1) % 2) - 1) * v.prod(-1) / (t.arange(pow-1) + 1).prod(-1)
+            return r
+        assert self.C % 4 == 0
+        self._coeffs = coeff(t.arange(0, self.C+1), self.POW, self.C//self.POW)
+        # some numbers
+        self.M = M
+        self.C = C
+        self.L = L
+        self.H = H
+    
+    @t.no_grad()
+    def inp_position_code(self, OFF:int, LEN:int):
+        """
+        compute output position code (IPC) from positions
+        """
+        # encoding code
+        N = self.C // self.POW
+        X = t.arange(0, LEN, device=self.device)
+        Y = t.arange(0, self.C+1, device=self.device)
+        OFF = self.L / N + OFF
+        X = t.cos(Y * (((X + OFF) / self.L) * t.pi).unsqueeze(-1))
+        X[:, 0] /= 2
+        # put coefficients into their place
+        return self._coeffs.to(self.device) * X / N ** (self.POW-1) / 2
+
+    @t.no_grad()
+    def out_position_code(self, OFF:int, LEN:int):
+        """
+        compute output position code (OPC) from positions
+        """
+        # decoding code
+        Y = t.arange(0, self.C+1, device=self.device)
+        X = t.arange(0, self.L, device=self.device)
+        X = t.cos(-Y * ((X / self.L) * t.pi).unsqueeze(-1)).cumsum(0) / self.L
+        # a very small elementwise perturbation to stop information leak
+        if self.training:
+            X[:, 0] += 1e-3 * t.randn_like(X[:, 0])
+        # return output position code
+        return X[OFF:LEN+OFF]
+
+    @property
+    def device(self):
+        return self.dummy.device
+
+    def forward(self, x):
+        """
+        x: [L, D]
+        return: [L, D, H]
+        """
+        L = x.shape[-2]
+        lnx = self.ln(self.pe(x))
+        k, q, v = t.exp(self.k(lnx)), t.exp(self.q(lnx)), self.v(x)
+        ipc, opc = self.inp_position_code(0, L), self.out_position_code(0, L)
+        out = t.einsum("...imh, ...idh, ...ic, ...omh, ...oc -> ...odh", k, v, ipc, q, opc)
+        return out
+
+    def iterate(self, x, cache) -> tuple[t.Tensor, tuple[int, t.Tensor]]:
+        """
+        x: [1, D]
+        cache: int, [M, C+1, D, H]
+        return: [1, D, H]
+        """
+        assert x.shape[-2] == 1
+        off, mem = cache
+        lnx = self.ln(x)
+        k, q, v = t.exp(-self.k(lnx).relu()), t.exp(-self.q(lnx).relu()), self.v(x)
+        ipc, opc = self.inp_position_code(off, 1), self.out_position_code(off, 1)
+        mem = mem + t.einsum("...imh, ...idh, ...ic -> ...mcdh", k, v, ipc)
+        out = t.einsum("...mcdh, ...oc -> ...odh", q, opc)
+        cache = off + 1, mem
+        return out, cache
+
+    def init_cache(self) -> tuple[int, t.Tensor]:
+        return 0, t.zeros(self.M, self.C+1, self.D, self.H, device=self.device)
+
+class CumAttention(t.nn.Module):
+    def __init__(self, D, A, H) -> None:
+        super().__init__()
+        """
+        O[i] = sum{k in 0..D} sum{j in 0..i} Q[i][k] * K[j][k] * V[j]
+        """
+        # dummy variable as device indicator
+        self.dummy = t.nn.Parameter(t.tensor(0.0))
+        # miscellaneous layers
+        self.pe = RoPE(D)
+        self.ln = t.nn.LayerNorm(D)
+        # key, query and value
+        self.k = t.nn.Sequential(
+            t.nn.Linear(D, A * H), t.nn.Unflatten(-1, A, H))
+        self.q = t.nn.Sequential(
+            t.nn.Linear(D, A * H), t.nn.Unflatten(-1, A, H))
+        self.v = t.nn.Sequential(
+            t.nn.Linear(D, D * H), t.nn.Unflatten(-1, D, H))
+        # some numbers
+        self.A = A
+        self.D = D
+        self.H = H
+
+    @property
+    def device(self):
+        return self.dummy.device
+
+    def forward(self, x):
+        # key, query, value
+        lnx = self.ln(self.pe(x))
+        k, q, v = t.exp(self.k(lnx)), t.exp(self.q(lnx)), self.v(self.pe(x))
+        # [..., L, A, D, H]
+        mem = t.einsum("...lah, ...ldh -> ...ladh", k, v).cumsum(-4)
+        # [..., L, D, H]
+        return t.einsum("...lah, ...ladh -> ...ldh", q, mem)
+
+    def iterate(self, x, cache):
+        # key, query, value
+        off, mem = cache
+        lnx = self.pe(self.ln(x), off)
+        k, q, v = t.exp(self.k(lnx)), t.exp(self.q(lnx)), self.v(self.pe(x, off))
+        mem = mem + t.einsum("...lah, ...ldh -> ...ladh", k, v)
+        return t.einsum("...lah, ...ladh -> ...ldh", q, mem), (off+1, mem)
+
+    def init_cache(self):
+        return 0, t.zeros(self.A, self.D, self.H)
+
 class DecoderLayer(t.nn.Module):
     def __init__(self, M, D, A, C, L, H, W, G, F, p=0.1) -> None:
         """
@@ -109,7 +256,7 @@ class DecoderLayer(t.nn.Module):
         """
         super().__init__()
         self.cnn = CNNLayer(D * H, W)
-        self.pe = RotaryPE(D)
+        self.pe = RoPE(D)
         self.ln0 = t.nn.LayerNorm((A * H))
         self.ln1 = t.nn.LayerNorm((A * H))
         self.ln2 = t.nn.LayerNorm((D, H))
@@ -201,6 +348,7 @@ class DecoderLayer(t.nn.Module):
         off = OFF
         x = t.arange(0, LEN, device=self.device)
         x = t.cos(-a * (((x + off) / l) * t.pi).unsqueeze(-1)).cumsum(0) / l
+        # a very small randomization to stop information leak
         if self.training:
             x[:, 0] += 1e-3 * t.randn_like(x[:, 0])
         return x
@@ -226,7 +374,7 @@ class DecoderLayer(t.nn.Module):
         a1 = self.dot(self.ln1(self.q_out(x)), self.k_mem)
         v1 = t.einsum("...lmh, ...lc, ...mcvh -> ...lvh", a1, opc, v0)
         v2 = self.cnn(self.v_inp(x)).unflatten(-1, (self.D, self.H))
-        return x + self.ffn(self.ln3(self.ln2(v1) + v2 + x.unsqueeze(dim=-1)).flatten(-2, -1))
+        return x + self.ffn(self.ln3(self.ln2(v1) + x.unsqueeze(dim=-1)).flatten(-2, -1))
 
     def iterate(self, x: t.Tensor, cache: tuple[int, t.Tensor, t.Tensor]) -> tuple[t.Tensor, tuple[int, t.Tensor, t.Tensor]]:
         L = x.shape[-2]
@@ -244,7 +392,7 @@ class DecoderLayer(t.nn.Module):
                   t.concat([window, x], dim=-2))
         v2 = self.cnn(self.v_inp(window)).unflatten(-1, (self.D, self.H))[..., -1:, :, :]
         cache = (offset + 1, v0, window)
-        return x + self.ffn(self.ln3(self.ln2(v1) + v2 + x.unsqueeze(dim=-1)).flatten(-2, -1)), cache
+        return x + self.ffn(self.ln3(self.ln2(v1) + x.unsqueeze(dim=-1)).flatten(-2, -1)), cache
 
     def init_cache(self) -> tuple[int, t.Tensor, t.Tensor]:
         return 0, t.zeros(self.M, self.C+1, self.D, self.H, device=self.device), None

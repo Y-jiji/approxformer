@@ -1,24 +1,27 @@
 import torch as t
 from model.approxformer import *
 from model.baseline import *
+from model.logicformer import *
 
-def run_tiny_shakespeare():
+def run_tiny_shakespeare(load, save):
     import random
     import datetime
     with open('dataset/tiny-shakespeare.txt') as f:
         text = f.read()
-    L = 14000
+    L = 4000
     I = 64
     model = ApproxFormer(256, L).to('cuda:0')
+    # model = LogicFormer(256, 128).to('cuda:0')
     optim = t.optim.Adam(model.parameters())
     running_loss = 5.0
     data = t.frombuffer(text.encode("ascii"), dtype=t.uint8, requires_grad=False).to(t.int).to('cuda:0')
-    try:
-        model_state_dict, optim_state_dict = t.load(f'ckpt/{datetime.datetime.date()}')
-        model.load_state_dict(model_state_dict)
-        optim.load_state_dict(optim_state_dict)
-    except:
-        pass
+    if load:
+        try:
+            model_state_dict, optim_state_dict = t.load(f'ckpt/{datetime.datetime.date()}')
+            model.load_state_dict(model_state_dict)
+            optim.load_state_dict(optim_state_dict)
+        except:
+            pass
     for i in range(1, 100001):
         model.train(True)
         OFF = random.randint(0, I-1) * L
@@ -35,7 +38,7 @@ def run_tiny_shakespeare():
                   f"\taccuracy {acc}\n"
                   f"\tloss     {running_loss}\n"
                   f"\ttime     {datetime.datetime.now()}")
-        if i % 10000 == 0:
+        if i % 10000 == 0 and save:
             t.save((model.state_dict(), optim.state_dict()), f'ckpt/{datetime.datetime.now().date()}')
             with t.no_grad():
                 model.train(False)
@@ -55,4 +58,4 @@ def run_wikitext():
     pass
 
 if __name__ == '__main__':
-    run_tiny_shakespeare()
+    run_tiny_shakespeare(False, False)
