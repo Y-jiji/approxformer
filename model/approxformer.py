@@ -25,6 +25,17 @@ class IterSequential(t.nn.Module):
             _cache.append(module.init_cache())
         return _cache
 
+class Forward(t.nn.Module):
+    def __init__(self, inner: t.nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+    def forward(self, x):
+        return self.inner(x)
+    def init_cache(self) -> None:
+        return None
+    def iterate(self, x: t.Tensor, cache: None) -> tuple[t.Tensor, None]:
+        return self.forward(x), None
+
 class ApproxFormer(t.nn.Module):
     def __init__(self, N: int, L: int) -> None:
         super().__init__()
@@ -238,6 +249,17 @@ class CumAttention(t.nn.Module):
     def init_cache(self):
         return 0, t.zeros(self.A, self.D, self.H)
 
+class FFN(t.nn.module):
+    def __init__(self, D, H, p=0.1) -> None:
+        self.inner = t.nn.Sequential(
+            t.nn.Flatten(-1, D * H),
+            t.nn.Linear(D*H // G, F // G),
+            t.nn.Flatten(-2, -1),
+            t.nn.ReLU(),
+            t.nn.Dropout(p),
+            t.nn.Linear(F, D),
+        )
+
 class DecoderLayer(t.nn.Module):
     def __init__(self, M, D, A, C, L, H, W, G, F, p=0.1) -> None:
         """
@@ -321,76 +343,15 @@ class DecoderLayer(t.nn.Module):
         v = t.cos(-a * ((x / l) * t.pi).unsqueeze(-1)).cumsum(0) / l
         return u, v
 
-    @t.no_grad()
-    def inp_position_code(self, OFF:int, LEN:int):
-        """
-        compute output position code (IPC) from positions
-        """
-        pow = 4
-        n = self.C // pow
-        a = t.arange(0, self.C+1, device=self.device)
-        l = self.L
-        x = t.arange(0, LEN, device=self.device)
-        off = self.L / n + OFF
-        x = t.cos(a * (((x + off) / l) * t.pi).unsqueeze(-1))
-        x[:, 0] /= 2
-        return self._coeffs.to(self.device) * x / n ** (pow-1) / 2
-
-    @t.no_grad()
-    def out_position_code(self, OFF:int, LEN:int):
-        """
-        compute output position code (OPC) from positions
-        """
-        a = t.arange(0, self.C+1, device=self.device)
-        l = self.L
-        off = OFF
-        x = t.arange(0, LEN, device=self.device)
-        x = t.cos(-a * (((x + off) / l) * t.pi).unsqueeze(-1)).cumsum(0) / l
-        # a very small randomization to stop information leak
-        if self.training:
-            x[:, 0] += 1e-3 * t.randn_like(x[:, 0])
-        return x
-
-    def dot(self, x, y):
-        """
-        compute multi-head attention
-        """
-        a = t.einsum("...ijh, ...kjh -> ...ikh", x.unflatten(-1, (self.A, self.H)), y.unflatten(-1, (self.A, self.H)))
-        assert (a < 15).all().item()
-        return a.clamp_max(15).exp()
-
     def forward(self, x: t.Tensor) -> t.Tensor:
         """
         parallel mode forward
         x: [..., L, INPUT]
         """
         L = x.shape[-2]
-        ipc = self.inp_position_code(0, L)
-        opc = self.out_position_code(0, L)
-        a0 = self.dot(self.q_mem, self.ln0(self.k_inp(self.pe(x))))
-        v0 = t.einsum("...mlh, ...lc, ...lvh -> ...mcvh", a0, ipc, self.v_inp(x).unflatten(-1, (self.D, self.H)))
-        a1 = self.dot(self.ln1(self.q_out(x)), self.k_mem)
-        v1 = t.einsum("...lmh, ...lc, ...mcvh -> ...lvh", a1, opc, v0)
-        v2 = self.cnn(self.v_inp(x)).unflatten(-1, (self.D, self.H))
-        return x + self.ffn(self.ln3(self.ln2(v1) + x.unsqueeze(dim=-1)).flatten(-2, -1))
 
     def iterate(self, x: t.Tensor, cache: tuple[int, t.Tensor, t.Tensor]) -> tuple[t.Tensor, tuple[int, t.Tensor, t.Tensor]]:
-        L = x.shape[-2]
-        assert L == 1
-        assert self.training == False
-        offset, v0, window = cache
-        ipc = self.inp_position_code(offset, L)
-        opc = self.out_position_code(offset, L)
-        a0 = self.dot(self.q_mem, self.ln0(self.k_inp(self.pe(x, offset))))
-        v0 = v0 + t.einsum("...mlh, ...lc, ...lvh -> ...mcvh", a0, ipc, self.v_inp(x).unflatten(-1, (self.D, self.H)))
-        a1 = self.dot(self.ln1(self.q_out(x)), self.k_mem)
-        v1 = t.einsum("...lmh, ...lc, ...mcvh -> ...lvh", a1, opc, v0)
-        window = (x if window is None else
-                  t.concat([window[..., 1:, :], x], dim=-2) if window.shape[-2] == self.W else
-                  t.concat([window, x], dim=-2))
-        v2 = self.cnn(self.v_inp(window)).unflatten(-1, (self.D, self.H))[..., -1:, :, :]
-        cache = (offset + 1, v0, window)
-        return x + self.ffn(self.ln3(self.ln2(v1) + x.unsqueeze(dim=-1)).flatten(-2, -1)), cache
+        pass
 
     def init_cache(self) -> tuple[int, t.Tensor, t.Tensor]:
         return 0, t.zeros(self.M, self.C+1, self.D, self.H, device=self.device), None
