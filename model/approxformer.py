@@ -224,9 +224,7 @@ class CumAttention(t.nn.Module):
         # key, query, value
         lnx = self.ln(self.pe(x))
         k, q, v = t.exp(self.k(lnx)), t.exp(self.q(lnx)), self.v(self.pe(x))
-        # [..., L, A, D, H]
         mem = t.einsum("...lah, ...ldh -> ...ladh", k, v).cumsum(-4)
-        # [..., L, D, H]
         return t.einsum("...lah, ...ladh -> ...ldh", q, mem)
 
     def iterate(self, x, cache):
