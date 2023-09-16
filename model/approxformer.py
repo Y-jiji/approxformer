@@ -86,24 +86,6 @@ class RoPE(t.nn.Module):
     def init_cache(self) -> int:
         return 0
 
-class CNNLayer(t.nn.Module):
-    def __init__(self, I, W) -> None:
-        super().__init__()
-        self.ker = t.nn.Parameter(t.randn(I, 1, W))
-        self.W = W
-        self.I = I
-
-    def forward(self, x: t.Tensor):
-        with t.no_grad():
-            pad = x[..., 0:1, :].repeat_interleave(self.W - 1, dim=-2).detach().transpose(-2, -1)
-        return t.nn.functional.conv1d(t.concat([pad, x.transpose(-2, -1)], dim=-1), self.ker.softmax(dim=-1), t.zeros(self.I, device=x.device), groups=self.I).transpose(-2, -1)
-
-    def iterate(self, x: t.Tensor, window: None | t.Tensor) -> tuple[t.Tensor, None | t.Tensor]:
-        window = (x if window is None else
-                  t.concat([window[..., 1:, :], x], dim=-2) if window.shape[-2] == self.W else
-                  t.concat([window, x], dim=-2))
-        return self.forward(window)[..., -1:, :, :], window
-
 class GapAttention(t.nn.Module):
     POW = 4
     def __init__(self, D, H, C, M, L) -> None:
@@ -249,126 +231,27 @@ class CumAttention(t.nn.Module):
     def init_cache(self):
         return 0, t.zeros(self.A, self.D, self.H)
 
-class FFN(t.nn.module):
-    def __init__(self, D, H, p=0.1) -> None:
-        self.inner = t.nn.Sequential(
-            t.nn.Flatten(-1, D * H),
-            t.nn.Linear(D*H // G, F // G),
-            t.nn.Flatten(-2, -1),
-            t.nn.ReLU(),
-            t.nn.Dropout(p),
-            t.nn.Linear(F, D),
-        )
-
 class DecoderLayer(t.nn.Module):
-    def __init__(self, M, D, A, C, L, H, W, G, F, p=0.1) -> None:
-        """
-        M: size of memory
-        H: number of heads
-        D: size of token representation
-        A: size of attention matcher
-        C: size of position code
-        L: maximal length
-        W: 1d cnn kernel width
-        G: groups in feed-forward network
-        F: feed forward dimensions
-        p: dropout rate
-        """
-        super().__init__()
-        self.cnn = CNNLayer(D * H, W)
-        self.pe = RoPE(D)
-        self.ln0 = t.nn.LayerNorm((A * H))
-        self.ln1 = t.nn.LayerNorm((A * H))
-        self.ln2 = t.nn.LayerNorm((D, H))
-        self.ln3 = t.nn.LayerNorm((D, H))
-        # scaling down will alleviate some numerical issues
-        self.q_mem = t.nn.Parameter(t.randn(M, A * H) / 1000)
-        self.k_mem = t.nn.Parameter(t.randn(M, A * H) / 1000)
-        self.k_inp = t.nn.Linear(D, A * H)
-        self.q_out = t.nn.Linear(D, A * H)
-        self.v_inp = t.nn.Linear(D, D * H)
-        self.dummy = t.nn.Parameter(t.tensor([]))
-        self.ffn = t.nn.Sequential(
-            t.nn.Unflatten(-1, (G, D*H // G)),
-            t.nn.Linear(D*H // G, F // G),
-            t.nn.Flatten(-2, -1),
-            t.nn.ReLU(),
-            t.nn.Dropout(p),
-            t.nn.Linear(F, D),
+    def __init__(self, D, A, H):
+        self.att = IterSequential(
+            CumAttention(D, A, H),
+            Forward(t.nn.LayerNorm((D, H))),
         )
-        self.C = C
-        self.D = D
-        self.A = A
-        self.H = H
-        self.M = M
-        self.L = L
-        self.W = W
-        # precomputed coefficients for kernel function
-        def combi(n, x):
-            return t.arange(n+1-x, n+1).prod() / t.arange(1, x+1).prod()
-        def coeff(u, pow, n):
-            u = u + pow * n + pow - 1
-            r = t.zeros_like(u).float()
-            for i in range(pow):
-                v = (u.unsqueeze(-1) - (2 * n + 1) * i - t.arange(pow-1)).relu()
-                c = combi(pow, i)
-                r += c * (2 * ((i + 1) % 2) - 1) * v.prod(-1) / (t.arange(pow-1) + 1).prod(-1)
-            return r
-        assert self.C % 4 == 0
-        self._coeffs = coeff(t.arange(0, self.C+1), 4, self.C//4)
+        self.ffn = t.nn.Sequential(
+            t.nn.Flatten(-2, -1),
+            t.nn.LayerNorm((D * H, )),
+            t.nn.Linear(D * H, 2048),
+            t.nn.ReLU(),
+            t.nn.Dropout(0.1),
+            t.nn.Linear(2048, D),
+        )
 
-    @property
-    def device(self):
-        return self.dummy.device
+    def forward(self, x):
+        return self.ffn(self.att(x) + x.unsqueeze(-1)) + x
 
-    @staticmethod
-    def normalize(x):
-        return x / (x**2).sum(dim=-1, keepdim=True)**(1/2)
+    def iterate(self, x, cache):
+        y, cache = self.att.iterate(x, cache)
+        return self.ffn(y + x.unsqueeze(-1)) + x, cache
 
-    @staticmethod
-    def d_pow(x, l, n, pow, off):
-        def combi(n, x):
-            return t.arange(n+1-x, n+1).prod() / t.arange(1, x+1).prod()
-        def coeff(u):
-            u = u + pow * n + pow - 1
-            r = t.zeros_like(u).float()
-            for i in range(pow):
-                v = (u.unsqueeze(-1) - (2 * n + 1) * i - t.arange(pow-1)).relu()
-                c = combi(pow, i)
-                r += c * (2 * ((i + 1) % 2) - 1) * v.prod(-1) / (t.arange(pow-1) + 1).prod(-1)
-            return r
-        a = t.arange(0, pow*n+1)
-        u = coeff(a) * t.cos(a * (((x + off) / l) * t.pi).unsqueeze(-1)) / n ** (pow-1) / 2
-        u[:, 0] /= 2
-        v = t.cos(-a * ((x / l) * t.pi).unsqueeze(-1)).cumsum(0) / l
-        return u, v
-
-    def forward(self, x: t.Tensor) -> t.Tensor:
-        """
-        parallel mode forward
-        x: [..., L, INPUT]
-        """
-        L = x.shape[-2]
-
-    def iterate(self, x: t.Tensor, cache: tuple[int, t.Tensor, t.Tensor]) -> tuple[t.Tensor, tuple[int, t.Tensor, t.Tensor]]:
-        pass
-
-    def init_cache(self) -> tuple[int, t.Tensor, t.Tensor]:
-        return 0, t.zeros(self.M, self.C+1, self.D, self.H, device=self.device), None
-
-if __name__ == '__main__':
-    with t.no_grad():
-        model = ApproxFormer(128, 8000)
-        model.train(False)
-        x = t.randint(0, 127, (10, 1000))
-        cache = model.init_cache()
-        ys = []
-        for i in range(x.shape[-1]):
-            if i % 100 == 0: print(i)
-            y, cache = model.iterate(x[..., i:i+1], cache)
-            ys.append(y)
-        y0 = t.concat(ys, dim=-2)
-        y1 = model.forward(x)
-        y2 = model.forward(t.randint(0, 127, (10, 1000)))
-        print(((y0 - y1).abs() / y1).mean(dim=-2))
-        print(((y2 - y1).abs() / y1).mean(dim=-2))
+    def init_cache(self):
+        return self.att.init_cache()
