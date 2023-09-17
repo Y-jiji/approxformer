@@ -9,7 +9,7 @@ def run_tiny_shakespeare(load, save):
     with open('dataset/tiny-shakespeare.txt') as f:
         text = f.read()
     L = 4000
-    I = 64
+    I = 128
     model = ApproxFormer(256, L).to('cuda:0')
     # model = LogicFormer(256, 128).to('cuda:0')
     optim = t.optim.Adam(model.parameters())
@@ -55,7 +55,11 @@ def run_tiny_shakespeare(load, save):
                 print(acc / L)
 
 def run_wikitext():
-    pass
+    import torchtext as tt
+    train, valid, test = tt.datasets.WikiText2("dataset/wikitext2")
+    for x in train:
+        print(x)
 
 if __name__ == '__main__':
-    run_tiny_shakespeare(False, False)
+    # run_tiny_shakespeare(False, True)
+    run_wikitext()

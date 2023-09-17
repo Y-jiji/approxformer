@@ -1,6 +1,35 @@
 import torch as t
 from typing import *
 
+"""
+The main model. 
+"""
+
+class ApproxFormer(t.nn.Module):
+    def __init__(self, N: int, L: int) -> None:
+        super().__init__()
+        self.embed = t.nn.Embedding(N, 128)
+        self.inner = IterSequential(
+            RoPE(128),
+            DecoderLayer(128, 4, 128, 128, L),
+            DecoderLayer(128, 4, 128, 128, L),
+        )
+        self.output = t.nn.Linear(128, N, bias=False)
+
+    def forward(self, x: t.Tensor) -> t.Tensor:
+        return self.output(self.inner(self.embed(x))).softmax(dim=-1)
+
+    def init_cache(self) -> list[Any]:
+        return self.inner.init_cache()
+
+    def iterate(self, x: t.Tensor, cache: list[Any]) -> tuple[t.Tensor, list[Any]]:
+        x, cache = self.inner.iterate(self.embed(x), cache)
+        return self.output(x).softmax(dim=-1), cache
+
+"""
+Some tool layers are listed below. 
+"""
+
 class IterSequential(t.nn.Module):
     def __init__(self, *args):
         super().__init__()
@@ -36,34 +65,16 @@ class Forward(t.nn.Module):
     def iterate(self, x: t.Tensor, cache: None) -> tuple[t.Tensor, None]:
         return self.forward(x), None
 
-class ApproxFormer(t.nn.Module):
-    def __init__(self, N: int, L: int) -> None:
+class DeMax(t.nn.Module):
+    def __init__(self) -> None:
         super().__init__()
-        self.embed = t.nn.Embedding(N, 128)
-        self.inner = IterSequential(
-            RoPE(128),
-            DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=4, W=128, G=4, F=1024),
-            DecoderLayer(M=32, D=128, A=64, C=128, L=L, H=2, W=128, G=4, F=1024),
-        )
-        self.output = t.nn.Linear(128, N, bias=False)
-        with t.no_grad():
-            self.output.weight.set_(-self.embed.weight / 100)
-
-    def forward(self, x: t.Tensor) -> t.Tensor:
-        return self.output(self.inner(self.embed(x))).softmax(dim=-1)
-
-    def init_cache(self) -> list[Any]:
-        return self.inner.init_cache()
-
-    def iterate(self, x: t.Tensor, cache: list[Any]) -> tuple[t.Tensor, list[Any]]:
-        x, cache = self.inner.iterate(self.embed(x), cache)
-        return self.output(x).softmax(dim=-1), cache
+    def forward(self, x) -> None:
+        return x - (1-1e-3) * (x.max(-1, True).values - 15).relu()
 
 class RoPE(t.nn.Module):
     def __init__(self, N: int) -> None:
         super().__init__()
         self.N = N
-        self.gamma = t.nn.Parameter(t.tensor(0.0))
         self.dummy = t.nn.Parameter(t.tensor(0.0))
         assert N % 2 == 0
 
@@ -78,7 +89,7 @@ class RoPE(t.nn.Module):
             y = t.arange(0, L, device=self.device).unsqueeze(dim=-1) + OFFSET
             f = t.arange(0, self.N, device=self.device) + 2
             w = y * 2 ** -(4 + f % (self.N // 2)) * t.pi + (2 * f > self.N) * t.pi / 2
-        return (1 - self.gamma.sigmoid()) * x + self.gamma.sigmoid() * (t.concat([x[..., self.N//2:], x[..., :self.N//2]], dim=-1) * w.sin() + x * w.cos())
+        return t.concat([x[..., self.N//2:], x[..., :self.N//2]], dim=-1) * w.sin() + x * w.cos()
 
     def iterate(self, x: t.Tensor, offset: int) -> tuple[t.Tensor, int]:
         return self.forward(x, offset), offset + 1
@@ -94,14 +105,14 @@ class GapAttention(t.nn.Module):
         self.dummy = t.nn.Parameter(t.tensor(0.0))
         # miscellaneous layers
         self.pe = RoPE(D)
-        self.ln = t.nn.LayerNorm(D * H)
+        self.ln = t.nn.LayerNorm(D * H, elementwise_affine=False)
         # key, query and value
         self.k = t.nn.Sequential(
-            t.nn.Linear((D, M * H)), t.nn.Unflatten(-1, (M, H)))
+            t.nn.Linear(D, M * H), DeMax(), t.nn.Unflatten(-1, (M, H)))
         self.q = t.nn.Sequential(
-            t.nn.Linear((D, M * H)), t.nn.Unflatten(-1, (M, H)))
+            t.nn.Linear(D, M * H), DeMax(), t.nn.Unflatten(-1, (M, H)))
         self.v = t.nn.Sequential(
-            t.nn.Linear((D, D * H)), t.nn.Unflatten(-1, (D, H)))
+            t.nn.Linear(D, D * H), t.nn.Unflatten(-1, (D, H)))
         # precomputed coefficients for kernel function
         def combi(n, x):
             return t.arange(n+1-x, n+1).prod() / t.arange(1, x+1).prod()
@@ -113,13 +124,16 @@ class GapAttention(t.nn.Module):
                 c = combi(pow, i)
                 r += c * (2 * ((i + 1) % 2) - 1) * v.prod(-1) / (t.arange(pow-1) + 1).prod(-1)
             return r
-        assert self.C % 4 == 0
-        self._coeffs = coeff(t.arange(0, self.C+1), self.POW, self.C//self.POW)
+        assert C % 4 == 0
+        self._coeffs = coeff(t.arange(0, C+1), self.POW, C//self.POW)
         # some numbers
         self.M = M
         self.C = C
         self.L = L
         self.H = H
+        # smaller initialization works better
+        t.nn.init.normal_(self.k.named_parameters('weight').__next__()[1], 1e-3, 1e-2)
+        t.nn.init.normal_(self.q.named_parameters('weight').__next__()[1], 1e-3, 1e-2)
     
     @t.no_grad()
     def inp_position_code(self, OFF:int, LEN:int):
@@ -161,8 +175,7 @@ class GapAttention(t.nn.Module):
         return: [L, D, H]
         """
         L = x.shape[-2]
-        lnx = self.ln(self.pe(x))
-        k, q, v = t.exp(self.k(lnx)), t.exp(self.q(lnx)), self.v(x)
+        k, q, v = t.exp(self.k(x)), t.exp(self.q(x)), self.v(x)
         ipc, opc = self.inp_position_code(0, L), self.out_position_code(0, L)
         out = t.einsum("...imh, ...idh, ...ic, ...omh, ...oc -> ...odh", k, v, ipc, q, opc)
         return out
@@ -175,8 +188,7 @@ class GapAttention(t.nn.Module):
         """
         assert x.shape[-2] == 1
         off, mem = cache
-        lnx = self.ln(x)
-        k, q, v = t.exp(-self.k(lnx).relu()), t.exp(-self.q(lnx).relu()), self.v(x)
+        k, q, v = t.exp(self.k(x)), t.exp(self.q(x)), self.v(x)
         ipc, opc = self.inp_position_code(off, 1), self.out_position_code(off, 1)
         mem = mem + t.einsum("...imh, ...idh, ...ic -> ...mcdh", k, v, ipc)
         out = t.einsum("...mcdh, ...oc -> ...odh", q, opc)
@@ -195,19 +207,24 @@ class CumAttention(t.nn.Module):
         # dummy variable as device indicator
         self.dummy = t.nn.Parameter(t.tensor(0.0))
         # miscellaneous layers
-        self.pe = RoPE(D)
         self.ln = t.nn.LayerNorm(D)
         # key, query and value
         self.k = t.nn.Sequential(
-            t.nn.Linear(D, A * H), t.nn.Unflatten(-1, A, H))
+            t.nn.Linear(D, A * H, bias=False), DeMax(), t.nn.Unflatten(-1, (A, H)))
         self.q = t.nn.Sequential(
-            t.nn.Linear(D, A * H), t.nn.Unflatten(-1, A, H))
-        self.v = t.nn.Sequential(
-            t.nn.Linear(D, D * H), t.nn.Unflatten(-1, D, H))
+            t.nn.Linear(D, A * H, bias=False), DeMax(), t.nn.Unflatten(-1, (A, H)))
+        self.v = IterSequential(
+            Forward(t.nn.Linear(D, D * H, bias=False)), 
+            RoPE(D * H), 
+            Forward(t.nn.Unflatten(-1, (D, H)))
+        )
         # some numbers
         self.A = A
         self.D = D
         self.H = H
+        # smaller initialization works better
+        t.nn.init.normal_(self.k.named_parameters('weight').__next__()[1], 1e-3, 1e-2)
+        t.nn.init.normal_(self.q.named_parameters('weight').__next__()[1], 1e-3, 1e-2)
 
     @property
     def device(self):
@@ -215,43 +232,42 @@ class CumAttention(t.nn.Module):
 
     def forward(self, x):
         # key, query, value
-        lnx = self.ln(self.pe(x))
-        k, q, v = t.exp(self.k(lnx)), t.exp(self.q(lnx)), self.v(self.pe(x))
-        mem = t.einsum("...lah, ...ldh -> ...ladh", k, v).cumsum(-4)
-        return t.einsum("...lah, ...ladh -> ...ldh", q, mem)
+        k, q, v = (self.k(x).exp(), self.q(x).exp(), self.v(x))
+        mem = t.einsum("...lah, ...ldh -> ...ladh", k, v.exp()).cummax(-4).values
+        return t.einsum("...lah, ...ladh -> ...ladh", q, mem).max(-3).values.log()
 
     def iterate(self, x, cache):
         # key, query, value
-        off, mem = cache
-        lnx = self.pe(self.ln(x), off)
-        k, q, v = t.exp(self.k(lnx)), t.exp(self.q(lnx)), self.v(self.pe(x, off))
-        mem = mem + t.einsum("...lah, ...ldh -> ...ladh", k, v)
-        return t.einsum("...lah, ...ladh -> ...ldh", q, mem), (off+1, mem)
+        c0, mem = cache
+        k, q, (v, c0) = (self.k(x).exp(), self.q(x).exp(), self.v.iterate(x, c0))
+        mem = t.maximum(mem, t.einsum("...lah, ...ldh -> ...ladh", k, v.exp()))
+        return t.einsum("...lah, ...ladh -> ...ladh", q, mem).max(-3).values.log(), (c0, mem)
 
     def init_cache(self):
-        return 0, t.zeros(self.A, self.D, self.H)
+        return self.v.init_cache(), t.zeros(self.A, self.D, self.H, device=self.device)
 
 class DecoderLayer(t.nn.Module):
-    def __init__(self, D, A, H):
-        self.att = IterSequential(
-            CumAttention(D, A, H),
-            Forward(t.nn.LayerNorm((D, H))),
-        )
+    def __init__(self, D, H, C, M, L):
+        super().__init__()
+        self.att = GapAttention(D, H, C, M, L)
         self.ffn = t.nn.Sequential(
             t.nn.Flatten(-2, -1),
-            t.nn.LayerNorm((D * H, )),
             t.nn.Linear(D * H, 2048),
             t.nn.ReLU(),
             t.nn.Dropout(0.1),
             t.nn.Linear(2048, D),
         )
 
+    @staticmethod
+    def norm(x):
+        return x * (x ** 2).sum(-2, True) ** (-1/2)
+
     def forward(self, x):
-        return self.ffn(self.att(x) + x.unsqueeze(-1)) + x
+        return self.ffn(self.norm(self.att(x)) + x.unsqueeze(-1)) + x
 
     def iterate(self, x, cache):
         y, cache = self.att.iterate(x, cache)
-        return self.ffn(y + x.unsqueeze(-1)) + x, cache
+        return self.ffn(self.norm(y) + x.unsqueeze(-1)) + x, cache
 
     def init_cache(self):
         return self.att.init_cache()

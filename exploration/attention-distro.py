@@ -37,20 +37,21 @@ def center_attention(q0, k0):
     return inner
 
 def draw_attention_matrix():
-    L = 500
-    D = 100
-    k = t.randn(L, D)
+    L = 200
+    D = 10
+    x = t.randn(L, D)
+    k = x.matmul(t.randn(D, D))
     cmap = 'gray'
     # att = dot_attention
     # att = linear_attention
-    qm = t.randn(32, D) * 10
-    km = t.randn(32, D) * 10
+    qm = t.randn(32, D) * 100
+    km = t.randn(32, D) * 100
     att = center_attention(km, qm)
     plt.subplot(1, 3, 1)
-    plt.imshow(att(t.randn(L, D), k), cmap=cmap)
+    plt.imshow(att(x.matmul(t.randn(D, D)), k), cmap=cmap)
     plt.colorbar()
     plt.subplot(1, 3, 2)
-    plt.imshow(att(t.randn(L, D), k), cmap=cmap)
+    plt.imshow(att(x.matmul(t.randn(D, D)), k), cmap=cmap)
     plt.colorbar()
     plt.subplot(1, 3, 3)
     plt.imshow(att(t.randn(100, L, D), k).mean(dim=0), cmap=cmap)
