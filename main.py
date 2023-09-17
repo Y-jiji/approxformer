@@ -6,6 +6,9 @@ from model.logicformer import *
 
 import lightning as L
 import torch.nn.functional as F
+from tokenizers import Bert
+
+from typing import *
 
 class LitWrapper(L.LightningModule):
     def __init__(self, model: t.nn.Module) -> None:
@@ -22,17 +25,31 @@ class LitWrapper(L.LightningModule):
         optimizer = t.optim.Adam(self.parameters())
         return optimizer
 
-def main(
-    model='approxformer'|'gpt2', 
-    tokenizer='bert'|'gpt2', 
-    dataset='wikitext2'|'shakespeare'|'wikitext103'
-) -> None:
-    # use pytorch lightning
-    module = LitWrapper(
-        ApproxFormer() if model == 'approxformer' else
-        None
-    )
-    pass
+def load_tokenizer(tokenizer: str):
+    if tokenizer == 'bert':
+        pass
+    raise Exception(f"unknown tokenizer name: {tokenizer}")
+
+def main(model: list[str], tokenizer: list[str], dataset: list[str]) -> None:
+    import itertools as it
+    for model, tokenizer, dataset in it.product(model, tokenizer, dataset):
+        # get vocabulary size from tokenizer
+        tokenzier = load_tokenizer(tokenizer)
+        # get data loader
+        pass
+        # use pytorch lightning for training
+        module = LitWrapper()
+        trainer = L.Trainer()
+        trainer.fit(module, )
+        # run tests
+        pass
 
 if __name__ == '__main__':
-    pass
+    import argparse as ap
+    import sys
+    ap = ap.ArgumentParser()
+    ap.add_argument('--model',      nargs='+', required=True)
+    ap.add_argument('--dataset',    nargs='+', required=True)
+    ap.add_argument('--tokenizer',  nargs='+', required=True)
+    args = ap.parse_args(sys.argv[1:])
+    print(args.model)
