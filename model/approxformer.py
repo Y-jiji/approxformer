@@ -88,7 +88,7 @@ class RoPE(t.nn.Module):
             assert self.N % 2 == 0
             y = t.arange(0, L, device=self.device).unsqueeze(dim=-1) + OFFSET
             f = t.arange(0, self.N, device=self.device) + 2
-            w = y * 2 ** -(4 + f % (self.N // 2)) * t.pi + (2 * f > self.N) * t.pi / 2
+            w = y * 2 ** -(f % (self.N // 2)) * t.pi + (2 * f > self.N) * t.pi / 2
         return t.concat([x[..., self.N//2:], x[..., :self.N//2]], dim=-1) * w.sin() + x * w.cos()
 
     def iterate(self, x: t.Tensor, offset: int) -> tuple[t.Tensor, int]:

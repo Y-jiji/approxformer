@@ -6,7 +6,6 @@ from model.logicformer import *
 
 import lightning as L
 import torch.nn.functional as F
-from tokenizers import Bert
 
 from typing import *
 
