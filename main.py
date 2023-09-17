@@ -27,6 +27,7 @@ def main(
     tokenizer='bert'|'gpt2', 
     dataset='wikitext2'|'shakespeare'|'wikitext103'
 ) -> None:
+    # use pytorch lightning
     module = LitWrapper(
         ApproxFormer() if model == 'approxformer' else
         None
