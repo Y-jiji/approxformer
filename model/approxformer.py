@@ -11,8 +11,8 @@ class ApproxFormer(t.nn.Module):
         self.embed = t.nn.Embedding(N, 128)
         self.inner = IterSequential(
             RoPE(128),
-            DecoderLayer(128, 4, 128, 128, L),
-            DecoderLayer(128, 4, 128, 128, L),
+            DecoderLayer(128, 4, 128, 128, 128, L),
+            DecoderLayer(128, 4, 128, 128, 128, L),
         )
         self.output = t.nn.Linear(128, N, bias=False)
 
@@ -96,6 +96,35 @@ class RoPE(t.nn.Module):
 
     def init_cache(self) -> int:
         return 0
+
+class ReceptCNN(t.nn.Module):
+    """
+    CNN + receptence gate
+    """
+    def __init__(self, D, W) -> None:
+        super().__init__()
+        self.W = W
+        self.D = D
+        self.w = t.nn.Parameter(t.tensor(D, 1, W))
+        self.r = t.nn.Sequential(t.nn.Linear(D, D), t.nn.Sigmoid())
+
+    def forward(self, x: t.Tensor) -> t.Tensor:
+        r = self.r(x)
+        x = t.concat([x[0:1].repeat_interleave(self.W - 1, -2), x], -2)
+        w = w.softmax(dim=-1)
+        g = t.conv1d(x.transpose(-2, -1), w, groups=self.D).transpose(-2, -1)
+        return (1 - r) * g + r * x
+
+    def init_cache(self) -> t.Tensor | None:
+        return None
+
+    def iterate(self, x, cache) -> tuple[t.Tensor, t.Tensor | None]:
+        cache = (
+            x                           if cache is None else
+            t.concat([cache, x], -2)    if cache.shape[-2] < self.W else
+            t.concat([cache[1:], x], -2)
+        )
+        return self.forward(cache), cache
 
 class GapAttention(t.nn.Module):
     POW = 4
@@ -198,58 +227,13 @@ class GapAttention(t.nn.Module):
     def init_cache(self) -> tuple[int, t.Tensor]:
         return 0, t.zeros(self.M, self.C+1, self.D, self.H, device=self.device)
 
-class CumAttention(t.nn.Module):
-    def __init__(self, D, A, H) -> None:
-        super().__init__()
-        """
-        O[i] = sum{k in 0..D} sum{j in 0..i} Q[i][k] * K[j][k] * V[j]
-        """
-        # dummy variable as device indicator
-        self.dummy = t.nn.Parameter(t.tensor(0.0))
-        # miscellaneous layers
-        self.ln = t.nn.LayerNorm(D)
-        # key, query and value
-        self.k = t.nn.Sequential(
-            t.nn.Linear(D, A * H, bias=False), DeMax(), t.nn.Unflatten(-1, (A, H)))
-        self.q = t.nn.Sequential(
-            t.nn.Linear(D, A * H, bias=False), DeMax(), t.nn.Unflatten(-1, (A, H)))
-        self.v = IterSequential(
-            Forward(t.nn.Linear(D, D * H, bias=False)), 
-            RoPE(D * H), 
-            Forward(t.nn.Unflatten(-1, (D, H)))
-        )
-        # some numbers
-        self.A = A
-        self.D = D
-        self.H = H
-        # smaller initialization works better
-        t.nn.init.normal_(self.k.named_parameters('weight').__next__()[1], 1e-3, 1e-2)
-        t.nn.init.normal_(self.q.named_parameters('weight').__next__()[1], 1e-3, 1e-2)
-
-    @property
-    def device(self):
-        return self.dummy.device
-
-    def forward(self, x):
-        # key, query, value
-        k, q, v = (self.k(x).exp(), self.q(x).exp(), self.v(x))
-        mem = t.einsum("...lah, ...ldh -> ...ladh", k, v.exp()).cummax(-4).values
-        return t.einsum("...lah, ...ladh -> ...ladh", q, mem).max(-3).values.log()
-
-    def iterate(self, x, cache):
-        # key, query, value
-        c0, mem = cache
-        k, q, (v, c0) = (self.k(x).exp(), self.q(x).exp(), self.v.iterate(x, c0))
-        mem = t.maximum(mem, t.einsum("...lah, ...ldh -> ...ladh", k, v.exp()))
-        return t.einsum("...lah, ...ladh -> ...ladh", q, mem).max(-3).values.log(), (c0, mem)
-
-    def init_cache(self):
-        return self.v.init_cache(), t.zeros(self.A, self.D, self.H, device=self.device)
-
 class DecoderLayer(t.nn.Module):
-    def __init__(self, D, H, C, M, L):
+    def __init__(self, D, H, C, M, W, L):
         super().__init__()
-        self.att = GapAttention(D, H, C, M, L)
+        self.att = IterSequential(
+            ReceptCNN(D, W),
+            GapAttention(D, H, C, M, L)
+        )
         self.ffn = t.nn.Sequential(
             t.nn.Flatten(-2, -1),
             t.nn.Linear(D * H, 2048),
