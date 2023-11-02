@@ -1,5 +1,6 @@
 import torch as t
 from typing import *
+import functools as FT
 
 """
 The main model. 
@@ -11,20 +12,23 @@ class ApproxFormer(t.nn.Module):
         self.embed = t.nn.Embedding(N, 128)
         self.inner = IterSequential(
             RoPE(128),
-            DecoderLayer(128, 4, 128, 128, 128, L),
-            DecoderLayer(128, 4, 128, 128, 128, L),
+            DecoderLayer(128, 2, 128, 64, 128, L),
         )
-        self.output = t.nn.Linear(128, N, bias=False)
+        self.output = t.nn.Sequential(
+            t.nn.LayerNorm(128),
+            t.nn.Linear(128, N, bias=False),
+            t.nn.Softmax(-1)
+        )
 
     def forward(self, x: t.Tensor) -> t.Tensor:
-        return self.output(self.inner(self.embed(x))).softmax(dim=-1)
+        return self.output(self.inner(self.embed(x)))
 
     def init_cache(self) -> list[Any]:
         return self.inner.init_cache()
 
     def iterate(self, x: t.Tensor, cache: list[Any]) -> tuple[t.Tensor, list[Any]]:
         x, cache = self.inner.iterate(self.embed(x), cache)
-        return self.output(x).softmax(dim=-1), cache
+        return self.output(x), cache
 
 """
 Some tool layers are listed below. 
@@ -33,7 +37,6 @@ Some tool layers are listed below.
 class IterSequential(t.nn.Module):
     def __init__(self, *args):
         super().__init__()
-        t.nn.Sequential
         for i, module in enumerate(args):
             self.add_module(str(i), module)
 
@@ -65,15 +68,10 @@ class Forward(t.nn.Module):
     def iterate(self, x: t.Tensor, cache: None) -> tuple[t.Tensor, None]:
         return self.forward(x), None
 
-class DeMax(t.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-    def forward(self, x) -> None:
-        return x - (1-1e-3) * (x.max(-1, True).values - 15).relu()
-
 class RoPE(t.nn.Module):
     def __init__(self, N: int) -> None:
         super().__init__()
+        assert N % 2 == 0
         self.N = N
         self.dummy = t.nn.Parameter(t.tensor(0.0))
         assert N % 2 == 0
@@ -82,13 +80,16 @@ class RoPE(t.nn.Module):
     def device(self):
         return self.dummy.device
 
+    @FT.lru_cache(5)
+    @t.no_grad()
+    def weight(self, L, OFFSET):
+        y = t.arange(0, L, device=self.device).unsqueeze(dim=-1) + OFFSET
+        f = t.arange(0, self.N, device=self.device) + 2
+        w = y * 2 ** -(f % (self.N // 2)) * t.pi + (2 * f > self.N) * t.pi / 2
+        return w
+
     def forward(self, x, OFFSET=0):
-        with t.no_grad():
-            L = x.shape[-2]
-            assert self.N % 2 == 0
-            y = t.arange(0, L, device=self.device).unsqueeze(dim=-1) + OFFSET
-            f = t.arange(0, self.N, device=self.device) + 2
-            w = y * 2 ** -(f % (self.N // 2)) * t.pi + (2 * f > self.N) * t.pi / 2
+        w = self.weight(x.shape[-2], OFFSET)
         return t.concat([x[..., self.N//2:], x[..., :self.N//2]], dim=-1) * w.sin() + x * w.cos()
 
     def iterate(self, x: t.Tensor, offset: int) -> tuple[t.Tensor, int]:
@@ -105,15 +106,17 @@ class ReceptCNN(t.nn.Module):
         super().__init__()
         self.W = W
         self.D = D
-        self.w = t.nn.Parameter(t.tensor(D, 1, W))
+        self.w = t.nn.Parameter(t.randn(D, 1, W))
         self.r = t.nn.Sequential(t.nn.Linear(D, D), t.nn.Sigmoid())
 
     def forward(self, x: t.Tensor) -> t.Tensor:
+        with t.no_grad():
+            p = x[..., 0:1, :].repeat_interleave(self.W - 1, -2)
+        p = t.concat([p, x], -2)
+        w = self.w.softmax(dim=-1)
+        g = t.conv1d(p.transpose(-2, -1), w, groups=self.D).transpose(-2, -1)
         r = self.r(x)
-        x = t.concat([x[0:1].repeat_interleave(self.W - 1, -2), x], -2)
-        w = w.softmax(dim=-1)
-        g = t.conv1d(x.transpose(-2, -1), w, groups=self.D).transpose(-2, -1)
-        return (1 - r) * g + r * x
+        return r * g + (1 - r) * x
 
     def init_cache(self) -> t.Tensor | None:
         return None
@@ -137,14 +140,16 @@ class GapAttention(t.nn.Module):
         self.ln = t.nn.LayerNorm(D * H, elementwise_affine=False)
         # key, query and value
         self.k = t.nn.Sequential(
-            t.nn.Linear(D, M * H), DeMax(), t.nn.Unflatten(-1, (M, H)))
+            t.nn.LayerNorm(D), t.nn.Linear(D, H * M), t.nn.Unflatten(-1, (H, M)))
         self.q = t.nn.Sequential(
-            t.nn.Linear(D, M * H), DeMax(), t.nn.Unflatten(-1, (M, H)))
+            t.nn.LayerNorm(D), t.nn.Linear(D, H * M), t.nn.Unflatten(-1, (H, M)))
         self.v = t.nn.Sequential(
-            t.nn.Linear(D, D * H), t.nn.Unflatten(-1, (D, H)))
+            t.nn.Linear(D, H * D), t.nn.Unflatten(-1, (H, D)))
         # precomputed coefficients for kernel function
+        @t.no_grad()
         def combi(n, x):
             return t.arange(n+1-x, n+1).prod() / t.arange(1, x+1).prod()
+        @t.no_grad()
         def coeff(u, pow, n):
             u = u + pow * n + pow - 1
             r = t.zeros_like(u).float()
@@ -154,16 +159,17 @@ class GapAttention(t.nn.Module):
                 r += c * (2 * ((i + 1) % 2) - 1) * v.prod(-1) / (t.arange(pow-1) + 1).prod(-1)
             return r
         assert C % 4 == 0
-        self._coeffs = coeff(t.arange(0, C+1), self.POW, C//self.POW)
+        self._coeffs = t.nn.Parameter(coeff(t.arange(0, C+1), self.POW, C//self.POW))
         # some numbers
         self.M = M
         self.C = C
         self.L = L
         self.H = H
         # smaller initialization works better
-        t.nn.init.normal_(self.k.named_parameters('weight').__next__()[1], 1e-3, 1e-2)
-        t.nn.init.normal_(self.q.named_parameters('weight').__next__()[1], 1e-3, 1e-2)
+        t.nn.init.normal_(self.k.named_parameters('weight').__next__()[1], 0.0, 1e-2)
+        t.nn.init.normal_(self.q.named_parameters('weight').__next__()[1], 0.0, 1e-2)
     
+    @FT.lru_cache(5)
     @t.no_grad()
     def inp_position_code(self, OFF:int, LEN:int):
         """
@@ -177,8 +183,9 @@ class GapAttention(t.nn.Module):
         X = t.cos(Y * (((X + OFF) / self.L) * t.pi).unsqueeze(-1))
         X[:, 0] /= 2
         # put coefficients into their place
-        return self._coeffs.to(self.device) * X / N ** (self.POW-1) / 2
+        return self._coeffs * X / N ** (self.POW-1) / 2
 
+    @FT.lru_cache(5)
     @t.no_grad()
     def out_position_code(self, OFF:int, LEN:int):
         """
@@ -188,9 +195,6 @@ class GapAttention(t.nn.Module):
         Y = t.arange(0, self.C+1, device=self.device)
         X = t.arange(0, self.L, device=self.device)
         X = t.cos(-Y * ((X / self.L) * t.pi).unsqueeze(-1)).cumsum(0) / self.L
-        # a very small elementwise perturbation to stop information leak
-        if self.training:
-            X[:, 0] += 1e-3 * t.randn_like(X[:, 0])
         # return output position code
         return X[OFF:LEN+OFF]
 
@@ -206,7 +210,12 @@ class GapAttention(t.nn.Module):
         L = x.shape[-2]
         k, q, v = t.exp(self.k(x)), t.exp(self.q(x)), self.v(x)
         ipc, opc = self.inp_position_code(0, L), self.out_position_code(0, L)
-        out = t.einsum("...imh, ...idh, ...ic, ...omh, ...oc -> ...odh", k, v, ipc, q, opc)
+        if self.training:
+            with t.no_grad():
+                opc = opc.clone()
+                opc[:, 0] += 1e-3 * t.randn_like(opc[:, 0])
+        mem = t.einsum("...ihm, ...ihd, ...ic -> ...hdcm", k, v, ipc)
+        out = t.einsum("...hdcm, ...ohm, ...oc -> ...ohd", mem, q, opc)
         return out
 
     def iterate(self, x, cache) -> tuple[t.Tensor, tuple[int, t.Tensor]]:
@@ -219,22 +228,28 @@ class GapAttention(t.nn.Module):
         off, mem = cache
         k, q, v = t.exp(self.k(x)), t.exp(self.q(x)), self.v(x)
         ipc, opc = self.inp_position_code(off, 1), self.out_position_code(off, 1)
-        mem = mem + t.einsum("...imh, ...idh, ...ic -> ...mcdh", k, v, ipc)
-        out = t.einsum("...mcdh, ...oc -> ...odh", q, opc)
+        if self.training:
+            with t.no_grad():
+                opc = opc.clone()
+                opc[:, 0] += 1e-3 * t.randn_like(opc[:, 0])
+        mem = mem + t.einsum("...ihm, ...ihd, ...ic -> ...hdcm", k, v, ipc)
+        out = t.einsum("...hdcm, ...ohm, ...oc -> ...ohd", mem, q, opc)
         cache = off + 1, mem
         return out, cache
 
     def init_cache(self) -> tuple[int, t.Tensor]:
-        return 0, t.zeros(self.M, self.C+1, self.D, self.H, device=self.device)
+        return 0, t.zeros(self.H, self.D, self.C+1, self.M, device=self.device)
 
 class DecoderLayer(t.nn.Module):
     def __init__(self, D, H, C, M, W, L):
         super().__init__()
         self.att = IterSequential(
             ReceptCNN(D, W),
-            GapAttention(D, H, C, M, L)
+            GapAttention(D, H, C, M, L),
+            Forward(t.nn.LayerNorm(D)),
         )
         self.ffn = t.nn.Sequential(
+            t.nn.LayerNorm(D),
             t.nn.Flatten(-2, -1),
             t.nn.Linear(D * H, 2048),
             t.nn.ReLU(),
@@ -242,16 +257,13 @@ class DecoderLayer(t.nn.Module):
             t.nn.Linear(2048, D),
         )
 
-    @staticmethod
-    def norm(x):
-        return x * (x ** 2).sum(-2, True) ** (-1/2)
-
     def forward(self, x):
-        return self.ffn(self.norm(self.att(x)) + x.unsqueeze(-1)) + x
+        y = self.att(x)
+        return self.ffn(y + x.unsqueeze(-2)) + x
 
     def iterate(self, x, cache):
         y, cache = self.att.iterate(x, cache)
-        return self.ffn(self.norm(y) + x.unsqueeze(-1)) + x, cache
+        return self.ffn(y + x.unsqueeze(-2)) + x, cache
 
     def init_cache(self):
         return self.att.init_cache()

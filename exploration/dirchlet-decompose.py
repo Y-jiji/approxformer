@@ -88,7 +88,6 @@ def dirichlet_pow_kernel(LEN, KAP):
     c = (2*N - f.abs()) * ALPHA / (2*N) + (1-ALPHA)
     c[0] *= 1/2
     u = t.concat([(-i * f).cos() * c, (-i * f).sin() * c], dim=-1)
-    u = u * (1 + t.randn_like(u) * 0.1)
     return v, u, lambda ikey, okey: t.einsum("ij, kj -> ik", ikey, okey)
 
 def d_pow(x, l, n, pow, off):
@@ -170,9 +169,7 @@ def random_direction_kernel(LEN, KAP):
 if __name__ == '__main__':
     t.manual_seed(154)
     with t.no_grad():
-        LEN = 2_000_000
-        KAP = 128
-        ikey, okey, mat = dirichlet_pow_kernel(LEN, KAP)
-        sample_and_plot(ikey, okey, mat, LEN, 10, 10000)
-        # sample_and_draw_matrix(ikey, okey, mat, LEN, 100)
+        ikey, okey= d_pow(t.arange(1000), 1000, 32, 4, 0)
+        mask = ikey@okey.T
+        plt.imshow(mask/mask.max())
         plt.show()
