@@ -17,7 +17,7 @@ class ProximalModel:
             p.requires_grad_(False)
         self.optimizer_m = torch.optim.Adam(self.model_new.parameters())
         self.optimizer_p = torch.optim.Adam(self.proxy_new.parameters())
-    def update(self, x: torch.Tensor, y: torch.Tensor, layer_next: TProximalModel | None, eta: float) -> None:
+    def update(self, x: torch.Tensor, y: torch.Tensor, layer_next: TProximalModel | None, eta: tuple[float, float]) -> None:
         # update critic using next layer critic (with its old forward function)
         if layer_next is not None:
             loss_proxy = self.proxy_new(self.model_new(x), y)
@@ -25,10 +25,11 @@ class ProximalModel:
                 loss_label = layer_next.proxy_new(layer_next.model_old(self.model_new(x)), y)
             (loss_proxy - loss_label).abs().mean().backward()
             self.optimizer_p.step()
+            self.model_new.zero_grad()
             self.proxy_new.zero_grad()
             with torch.no_grad():
                 for (p_new, p_old) in zip(self.proxy_new.parameters(), self.proxy_old.parameters()):
-                    p_old = p_new * eta + p_old * (1 - eta)
+                    p_old = p_new * eta[0] + p_old * (1 - eta[0])
         # update model_new by critic
         loss_proxy = self.proxy_old(self.model_new(x), y).mean()
         print(loss_proxy.item())
@@ -38,7 +39,7 @@ class ProximalModel:
         # update model_old by eta
         with torch.no_grad():
             for (p_new, p_old) in zip(self.model_new.parameters(), self.model_old.parameters()):
-                p_old = p_new * eta + p_old * (1 - eta)
+                p_old = p_new * eta[1] + p_old * (1 - eta[1])
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model_old(x)
@@ -50,9 +51,9 @@ class ProximalTrainer:
         loader = data.DataLoader(dataset, 16)
         for x, y in loader:
             for layer, layer_next in zip(self.layers[:-1], self.layers[1:]):
-                layer.update(x, y, layer_next, eta=1e-2)
+                layer.update(x, y, layer_next, eta=(1e-2, 1e-1))
             x = layer.forward(x)
-            self.layers[-1].update(x, y, None, eta=1e-2)
+            self.layers[-1].update(x, y, None, eta=(1e-2, 1e-1))
     @torch.no_grad()
     def apply(self, x):
         for layer in self.layers:
@@ -66,7 +67,16 @@ class Critic(torch.nn.Module):
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         _x = self.linear(x.flatten(0, -2)).log_softmax(-1)
         _y = y.flatten(0, -1)
-        return _x[torch.arange(_y.shape[0], device=_y.device), _y]
+        return -_x[torch.arange(_y.shape[0], device=_y.device), _y]
+
+class Tail(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.tensor(0.0))
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        _x = x.flatten(0, -2)
+        _y = y.flatten(0, -1)
+        return -_x[torch.arange(_y.shape[0], device=_y.device), _y]
 
 class Block(torch.nn.Module):
     def __init__(self, d_model: int, d_attention: int, n_heads: int, hidden: int) -> None:
@@ -82,8 +92,6 @@ class Block(torch.nn.Module):
             torch.nn.Linear(hidden, d_model),
             torch.nn.ReLU(),
         )
-        for p in self.ffn.parameters():
-            torch.nn.init.normal_(p, 0, 1e-4)
     def forward(self, x: torch.Tensor):
         _x = self.ln0(x)
         q, k = self.q(_x).clamp(-10, 10).exp(), self.k(_x).clamp(-10, 10).exp()
@@ -94,8 +102,11 @@ class Block(torch.nn.Module):
         return self.ffn((x.unsqueeze(-1) + self.ln1(qkv / den)).flatten(-2, -1)) + x
 
 if __name__ == '__main__':
-    trainer = ProximalTrainer([ProximalModel(Block(129, 32, 4, 2048).to('cuda:0'), Critic(129, 2048).to('cuda:0')) for i in range(32)])
-    l = [(torch.rand(256, 129).to('cuda:0'), torch.randint(0, 2047, (256, )).to('cuda:0')) for i in range(1000)]
-    for i in range(10):
+    trainer = ProximalTrainer(
+        [ProximalModel(Block(129, 32, 4, 2048).to('cuda:0'), Critic(129, 2048).to('cuda:0')) for i in range(31)] +
+        [ProximalModel(torch.nn.Sequential(Block(129, 32, 4, 2048), torch.nn.Linear(129, 2048), torch.nn.LogSoftmax(-1)).to('cuda:0'), Tail().to('cuda:0'))]
+    )
+    l = [(torch.rand(256, 129).to('cuda:0'), torch.randint(0, 2047, (256, )).to('cuda:0')) for i in range(10)]
+    for i in range(1000):
         trainer.train(l)
         print(f'finish {i}')
