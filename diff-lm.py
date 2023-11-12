@@ -1,66 +1,46 @@
 import torch as t
+import torch.distributions as distr
 
 class Embedding(t.nn.Module):
-    def __init__(self, V: int, D: int):
+    def __init__(self, V: int, D: int) -> None:
         super().__init__()
-        """
-        An alternative interpretation of embedding. 
-        INPUT:
-            V: vocabulary size
-            D: # of hidden state dimensions
-        ATTRIBUTES: 
-            μ: [V, D]   mean of each hidden state
-            σ: [V]      standard deviation of each hidden state
-            λlog: [V]   each label's present by probability λ, stored as ln(λ)
-        """
-        self.μ = t.nn.Parameter(t.randn(V, D))
-        self.σ = t.nn.Parameter(t.randn(V))
-        self.λlog = t.nn.Parameter(t.randn(V))
-
-    def forward(self, label: t.LongTensor) -> t.FloatTensor:
-        """
-        INPUT:
-            label:  [B, L] word label
-        OUPUT:
-            [B, L, D] hidden state for each label
-        """
-        return self.μ[label.flatten()].reshape(*label.shape, -1)
+        self.weight = t.nn.Parameter(t.randn(V, D))
+        self.output = t.nn.Parameter(t.randn(D, V))
 
     def vsize(self) -> int:
-        """
-        get vocabulary size
-        """
-        return self.μ.shape[0]
+        return self.weight.shape[0]
 
-    def diffuse(self, z: t.FloatTensor, scale: float) -> t.FloatTensor:
+    def forward(self, x: t.Tensor, α: float = 0) -> None:
         """
-        INPUT:
-            z:      [B, L, D]   hidden state
-            scale:  IS SCALAR   the scale factor of noise
-        OUTPUT:
-            [B, L, D] diffused hidden state
+        INPUT
+            x: [..., L, V] shaped probability tensor
+        OUTPUT
+            [..., L, D] shaped word vectors
         """
-        # sample gaussian variables, add to x
-        return scale * t.randn_like(z) + z
+        sample = distr.Dirichlet(t.ones_like(x)).sample()
+        x = x * (1-α) + sample * α
+        return x.matmul(self.weight)
+    
+    def diffuse(self, x: t.Tensor, n: int, α: float) -> None:
+        """
+        INPUT
+            x: [..., L, V] shaped probability tensor
+        OUTPUT
+            [..., L, V] shaped, noisy probability tensor
+        """
+        if n == 0: return x
+        sample = distr.Dirichlet(t.ones_like(x)).sample_n(n)
+        sample = t.einsum("...i, ...i -> ...", sample, (1-α)**t.arange(n, x.device))
+        return ((1-α)**n) * x + (α) * sample
 
-    def predict(self, z: t.FloatTensor) -> t.FloatTensor:
+    def predict(self, x: t.Tensor) -> None:
         """
-        INPUT: 
-            z:  [B, L, D] hidden state
-        OUTPUT:
-            [B, L, V] label probability, 
-                where V is the vocabulary size. 
+        INPUT
+            x: [..., L, D] shaped embedding tensor
+        OUTPUT
+            [..., L, V] shaped probability tensors
         """
-        # get lambda for each word
-        λ = self.λlog.softmax(0)
-        # compute distance to each distribution mean
-        d = -2 * t.einsum("ij, ...j -> ...i", self.μ, z)
-        d = d + t.einsum("ij, ij -> i", self.μ, self.μ)
-        d = d + t.einsum("...j, ...j -> ...", z, z).unsqueeze(-1)
-        # compute probability of joint distribution with label
-        p = λ * (self.σ**-1) * (2*t.pi)**(-1/2) * (-0.5*p*self.σ**-2).exp()
-        # return conditional probability of each label given hidden state
-        return p / p.sum(-1, keepdim=True)
+        return x.matmul(self.output).softmax(-1)
 
 class Layer(t.nn.Module):
     def __init__(self, D: int, H: int, C: int, Z: int) -> None:
@@ -126,45 +106,39 @@ class DiffusionLM(t.nn.Module):
         self.embed = Embedding(V, D)
         self.blocks = t.nn.ModuleList([Block(N, D, H, C, Z) for _ in range(M)])
 
-    def loss_local(self, i: int, β: float, label: t.LongTensor):
+    def loss_local(self, i: int, label: t.LongTensor, α: float):
         """
         train one block with one batch. 
         INPUT:
             i: the trained block
-            β: diffusion rate (must be positive)
+            α: diffusion rate (must be positive and between 0, 1)
             label: [B, L] a batch of sentence
         OUTPUT:
             loss: loss of this prediction
         """
         M = len(self.blocks)
-        x = self.embed(label[:, :-1])
-        y = self.embed(label[:, 1: ])
-        λ = (i + 1) / M
-        z_next = self.embed.diffuse((1 - λ) * x + λ * y , (1 + β) ** (M - 1 - i) - 1)
-        z_fuse = self.embed.diffuse(z_next + (x - y) / M, (1 + β) ** (M - 1 - i) * β)
-        z_pred = self.blocks[i].forward(z_fuse)
-        return ((z_next - z_pred) ** 2).sum()
-    
-    def loss_final(self, label: t.LongTensor):
-        """
-        train the embedding by entropy. 
-        """
-        π = self.embed.predict(self.embed.forward(label))
-        return π.flatten(0, -2)[label.flatten()].log().sum()
+        label = t.nn.functional.one_hot(label, self.embed.vsize())
+        label = self.embed.diffuse(label, α, M-1-i)
+        noise = self.embed.forward(label, α)
+        value = self.embed.predict(self.blocks[i].forward(noise))
+        return t.matmul("...j, ...j -> ...", label, value.log()).mean()
 
-    def forward(self, β: float, label: t.LongTensor) -> t.FloatTensor:
+    def forward(self, label: t.LongTensor, α: float = 0) -> t.FloatTensor:
         """
         next word prediction. 
         INPUT:
-            β: diffusion rate (must be positive)
+            α: diffusion rate (must be positive and between 0, 1)
             label: [B, L] label of words
         OUTPUT:
             probability distribution of the next label for each label
         """
         M = len(self.blocks)
-        z = self.embed.diffuse(self.embed(label), (1 + β) ** M - 1)
-        for b in self.blocks: z = b(z)
-        return self.embed.predict(z)
+        label = t.nn.functional.one_hot(label, self.embed.vsize())
+        label = self.embed.diffuse(label, α, M)
+        value = self.embed.forward(label, 0)
+        for b in self.blocks: 
+            value = self.embed.predict(b(value))
+        return value
 
 if __name__ == '__main__':
     label = t.randint(0, 127, (128, 1024), device='cuda:0')
